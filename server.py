@@ -7,10 +7,34 @@
 """
 import json, time, os, sqlite3, hashlib, secrets, string
 from datetime import datetime
+from collections import defaultdict
 from flask import Flask, request, render_template_string, redirect, make_response, g
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
+
+# ============ 安全措施 ============
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['X-Powered-By'] = ''
+    response.headers['Server'] = ''
+    return response
+
+login_attempts = defaultdict(list)
+
+def check_rate_limit(ip, action, max_attempts=5, window=300):
+    now = time.time()
+    attempts = [t for t in login_attempts[ip + "_" + action] if now - t < window]
+    login_attempts[ip + "_" + action] = attempts
+    if len(attempts) >= max_attempts:
+        return False
+    login_attempts[ip + "_" + action].append(now)
+    return True
 
 # 线上环境用 /data 持久化目录，本地开发用当前目录
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(__file__))
@@ -167,12 +191,13 @@ DASHBOARD = (
 ACCESS_PAGE = (
     '<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">'
     '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
-    '<title>资源页面</title><style>' + CSS + '.box{max-width:780px;text-align:left;max-height:85vh;overflow-y:auto}.cat{color:#6366f1;font-size:16px;margin:20px 0 8px 0;border-bottom:1px solid #333;padding-bottom:4px}</style></head>'
+    '<title>资源页面</title><style>' + CSS + '.box{max-width:780px;text-align:left;max-height:85vh;overflow-y:auto}.cat{color:#6366f1;font-size:16px;margin:20px 0 8px 0;border-bottom:1px solid #333;padding-bottom:4px}.table tr:nth-child(even){background:#252525}.table tr:hover{background:#2a2a2a}#searchBox:focus{border-color:#6366f1}</style></head>'
     '<body><div class="box">'
     '<h2 style="color:#22c55e;text-align:center">访问成功</h2>'
     '<p style="color:#aaa;text-align:center;margin-bottom:20px;font-size:13px">链接归属：{{ owner_email }}</p>'
+    '<input type="text" id="searchBox" placeholder="搜索工具..." style="width:100%;padding:10px;border-radius:8px;border:1px solid #444;background:#222;color:#fff;font-size:14px;margin-bottom:16px;outline:none" oninput="filterTools()">'
     # ---- 在线工具箱
-    '<h3 class="cat">在线工具箱</h3>'
+    '<h3 class="cat">\U0001f9f0 在线工具箱</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">IT-Tools</td><td style="padding:5px;color:#aaa">加密/转换/网络工具</td><td style="padding:5px"><a href="https://it-tools.tech" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -183,7 +208,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">ConvertX</td><td style="padding:5px;color:#aaa">1000+格式在线转换</td><td style="padding:5px"><a href="https://convertx.app" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- 设计与图像处理
-    '<h3 class="cat">设计与图像处理</h3>'
+    '<h3 class="cat">\U0001f3a8 设计与图像处理</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">Krita</td><td style="padding:5px;color:#aaa">专业开源绘画</td><td style="padding:5px"><a href="https://krita.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -196,7 +221,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">Font Library</td><td style="padding:5px;color:#aaa">海量开源字体</td><td style="padding:5px"><a href="https://fontlibrary.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- AI漫剪与视频创作
-    '<h3 class="cat">AI漫剪与视频创作</h3>'
+    '<h3 class="cat">\U0001f3ac AI漫剪与视频创作</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">CapCut 剪映</td><td style="padding:5px;color:#aaa">AI自动剪辑/字幕</td><td style="padding:5px"><a href="https://www.capcut.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -213,7 +238,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">Canva</td><td style="padding:5px;color:#aaa">全能设计/视频</td><td style="padding:5px"><a href="https://www.canva.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- AI与数据科学
-    '<h3 class="cat">AI与数据科学</h3>'
+    '<h3 class="cat">\U0001f916 AI与数据科学</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">DeepSeek</td><td style="padding:5px;color:#aaa">国产大模型</td><td style="padding:5px"><a href="https://chat.deepseek.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -224,7 +249,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">Mistral</td><td style="padding:5px;color:#aaa">欧洲开源大模型</td><td style="padding:5px"><a href="https://chat.mistral.ai" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- AI绘图与设计
-    '<h3 class="cat">AI绘图与设计</h3>'
+    '<h3 class="cat">\U0001f5bc AI绘图与设计</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">Midjourney</td><td style="padding:5px;color:#aaa">AI绘画天花板</td><td style="padding:5px"><a href="https://www.midjourney.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -238,7 +263,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">Vectorizer</td><td style="padding:5px;color:#aaa">位图转矢量</td><td style="padding:5px"><a href="https://vectorizer.ai" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- 办公效率
-    '<h3 class="cat">办公效率</h3>'
+    '<h3 class="cat">\U0001f4cb 办公效率</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">VS Code</td><td style="padding:5px;color:#aaa">代码编辑器</td><td style="padding:5px"><a href="https://code.visualstudio.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -248,7 +273,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">MrRSS</td><td style="padding:5px;color:#aaa">AI RSS阅读器</td><td style="padding:5px"><a href="https://github.com/nicepkg/mrrss" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- 实用工具
-    '<h3 class="cat">实用工具</h3>'
+    '<h3 class="cat">\U0001f527 实用工具</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">Blender</td><td style="padding:5px;color:#aaa">3D创作套件</td><td style="padding:5px"><a href="https://www.blender.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -263,7 +288,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">Syncthing</td><td style="padding:5px;color:#aaa">局域网文件同步</td><td style="padding:5px"><a href="https://syncthing.net" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- 效率与自动化
-    '<h3 class="cat">效率与自动化</h3>'
+    '<h3 class="cat">\u26a1 效率与自动化</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">uTools</td><td style="padding:5px;color:#aaa">效率神器/插件平台</td><td style="padding:5px"><a href="https://u.tools" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -278,7 +303,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">Geek Uninstaller</td><td style="padding:5px;color:#aaa">强力卸载</td><td style="padding:5px"><a href="https://geekuninstaller.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- 开发运维
-    '<h3 class="cat">开发运维</h3>'
+    '<h3 class="cat">\U0001f4bb 开发运维</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">DBeaver</td><td style="padding:5px;color:#aaa">数据库管理客户端</td><td style="padding:5px"><a href="https://dbeaver.io" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -289,7 +314,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">WindTerm</td><td style="padding:5px;color:#aaa">跨平台终端工具</td><td style="padding:5px"><a href="https://github.com/kingToolbox/WindTerm" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- 休闲游戏
-    '<h3 class="cat">休闲游戏</h3>'
+    '<h3 class="cat">\U0001f3ae 休闲游戏</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">Wesnoth</td><td style="padding:5px;color:#aaa">回合制奇幻战棋</td><td style="padding:5px"><a href="https://www.wesnoth.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -299,7 +324,7 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">Minute Maze</td><td style="padding:5px;color:#aaa">迷宫解谜游戏</td><td style="padding:5px"><a href="https://github.com/niclas-thor/minutemaze" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
     # ---- 资源与下载
-    '<h3 class="cat">资源与下载</h3>'
+    '<h3 class="cat">\U0001f4e6 资源与下载</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">Ninite</td><td style="padding:5px;color:#aaa">装机一条龙</td><td style="padding:5px"><a href="https://ninite.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -311,8 +336,34 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">AlternativeTo</td><td style="padding:5px;color:#aaa">软件替代品搜索</td><td style="padding:5px"><a href="https://alternativeto.net" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '<tr><td style="padding:5px">RG Mechanics</td><td style="padding:5px;color:#aaa">高压游戏资源</td><td style="padding:5px"><a href="https://rg-mechanics.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
+    # ---- 免费音乐下载
+    '<h3 class="cat">\U0001f3b5 免费音乐下载</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">MyFreeMP3</td><td style="padding:5px;color:#aaa">免费音乐下载</td><td style="padding:5px"><a href="https://tools.liumingye.cn/music" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">MusicFree</td><td style="padding:5px;color:#aaa">开源音乐播放器</td><td style="padding:5px"><a href="https://github.com/maotoumao/MusicFree" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Listen1</td><td style="padding:5px;color:#aaa">全网音乐聚合</td><td style="padding:5px"><a href="https://listen1.github.io/listen1" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">LX Music 洛雪音乐</td><td style="padding:5px;color:#aaa">开源全网音乐</td><td style="padding:5px"><a href="https://github.com/lyswhut/lx-music-desktop" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">YesPlayMusic</td><td style="padding:5px;color:#aaa">高颜值网易云客户端</td><td style="padding:5px"><a href="https://github.com/qier222/YesPlayMusic" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Spotube</td><td style="padding:5px;color:#aaa">开源Spotify客户端</td><td style="padding:5px"><a href="https://github.com/KRTirtho/spotube" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Free MP3 Download</td><td style="padding:5px;color:#aaa">免费MP3搜索下载</td><td style="padding:5px"><a href="https://free-mp3-download.net" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Slider.kz</td><td style="padding:5px;color:#aaa">全球音乐搜索</td><td style="padding:5px"><a href="https://slider.kz" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
+    # ---- 钓鱼地图与户外
+    '<h3 class="cat">\U0001f3a3 钓鱼地图与户外</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">\u9493\u9c7c\u4e4b\u5bb6</td><td style="padding:5px;color:#aaa">钓点/天气/潮汐</td><td style="padding:5px"><a href="https://www.diaoyu.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Fishbrain</td><td style="padding:5px;color:#aaa">全球钓点地图</td><td style="padding:5px"><a href="https://fishbrain.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">\u5965\u7ef4\u4e92\u52a8\u5730\u56fe</td><td style="padding:5px;color:#aaa">户外GPS轨迹</td><td style="padding:5px"><a href="https://www.ovital.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Windy</td><td style="padding:5px;color:#aaa">风力/天气可视化</td><td style="padding:5px"><a href="https://www.windy.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">\u4e24\u6b65\u8def</td><td style="padding:5px;color:#aaa">户外轨迹/约伴</td><td style="padding:5px"><a href="https://www.2bulu.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">\u516d\u53ea\u811a</td><td style="padding:5px;color:#aaa">户外GPS轨迹</td><td style="padding:5px"><a href="https://www.foooooot.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">\u6f6e\u6c50\u8868</td><td style="padding:5px;color:#aaa">全球潮汐预报</td><td style="padding:5px"><a href="https://www.tide-forecast.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Navionics</td><td style="padding:5px;color:#aaa">航海/水深地图</td><td style="padding:5px"><a href="https://www.navionics.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
     # ---- Android应用
-    '<h3 class="cat">Android应用</h3>'
+    '<h3 class="cat">\U0001f4f1 Android应用</h3>'
     '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
     '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
     '<tr><td style="padding:5px">Legado阅读</td><td style="padding:5px;color:#aaa">开源小说阅读器</td><td style="padding:5px"><a href="https://github.com/gedoor/legado" target="_blank" style="color:#6366f1">打开</a></td></tr>'
@@ -321,7 +372,8 @@ ACCESS_PAGE = (
     '<tr><td style="padding:5px">Organic Maps</td><td style="padding:5px;color:#aaa">隐私离线地图</td><td style="padding:5px"><a href="https://organicmaps.app" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '<tr><td style="padding:5px">Kotatsu</td><td style="padding:5px;color:#aaa">开源漫画阅读器</td><td style="padding:5px"><a href="https://github.com/nv95/Kotatsu" target="_blank" style="color:#6366f1">打开</a></td></tr>'
     '</table>'
-    '<p style="color:#555;font-size:11px;text-align:center;margin-top:16px">此链接仅限 {{ owner_email }} 本人访问</p>'
+    '<p style="color:#555;font-size:11px;text-align:center;margin-top:16px">归属: fengchunchun | 联系邮箱: 1130849943@qq.com</p>'
+    '<script>function filterTools(){var q=document.getElementById("searchBox").value.toLowerCase();var cats=document.querySelectorAll(".cat");var tables=document.querySelectorAll("table");var anyVisible=false;tables.forEach(function(t,i){var rows=t.querySelectorAll("tr:not(:first-child)");var catVisible=false;rows.forEach(function(r){var txt=r.textContent.toLowerCase();if(q===""||txt.indexOf(q)>-1){r.style.display="";catVisible=true}else{r.style.display="none"}});if(catVisible||q===""){if(cats[i])cats[i].style.display="";t.style.display="";anyVisible=true}else{if(cats[i])cats[i].style.display="none";t.style.display="none"}})}</script>'
     '</div></body></html>'
 )
 # ============ 路由 ============
@@ -339,8 +391,14 @@ def index():
 def login():
     if request.method == "GET":
         return render_template_string(LOGIN_PAGE)
+    if not check_rate_limit(request.remote_addr, "login"):
+        return render_template_string(LOGIN_PAGE, error="操作太频繁，请稍后再试")
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
+    if "@" not in email or "." not in email:
+        return render_template_string(LOGIN_PAGE, error="邮箱格式不正确")
+    if len(password) < 6 or len(password) > 128:
+        return render_template_string(LOGIN_PAGE, error="密码长度需在6-128位之间")
     db = get_db()
     user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
     if not user or user["password_hash"] != hash_password(password):
@@ -360,8 +418,12 @@ def register():
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
     invite = request.form.get("invite_code", "").strip().upper()
-    if len(password) < 6:
-        return render_template_string(REGISTER_PAGE, error="密码至少6位")
+    if not check_rate_limit(request.remote_addr, "register"):
+        return render_template_string(REGISTER_PAGE, error="操作太频繁，请稍后再试")
+    if "@" not in email or "." not in email:
+        return render_template_string(REGISTER_PAGE, error="邮箱格式不正确")
+    if len(password) < 6 or len(password) > 128:
+        return render_template_string(REGISTER_PAGE, error="密码长度需在6-128位之间")
     if invite not in VALID_INVITE_CODES:
         return render_template_string(REGISTER_PAGE, error="邀请码无效")
     db = get_db()
@@ -495,7 +557,7 @@ def access_link(token):
                    (link["user_id"], token, request.remote_addr, 0, "not_owner"))
         db.execute("UPDATE links SET access_count=access_count+1 WHERE id=?", (link["id"],))
         db.commit()
-        return "<h1 style='color:#ef4444;text-align:center;margin-top:100px'>此链接仅限生成者本人访问<br><span style='color:#aaa;font-size:14px'>非本人访问已被记录</span></h1>"
+        return "<h1 style='color:#ef4444;text-align:center;margin-top:100px'>此链接仅限生成者本人访问<br><span style='color:#aaa;font-size:14px'>非本人访问已被记录</span><br><br><span style='color:#aaa;font-size:12px'>归属: fengchunchun | 联系邮箱: 1130849943@qq.com</span></h1>"
 
     db.execute("UPDATE links SET used=1, access_count=access_count+1 WHERE id=?", (link["id"],))
     db.execute("INSERT INTO access_log (user_id, token, ip, success, reason) VALUES (?,?,?,?,?)",
