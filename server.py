@@ -1,0 +1,457 @@
+"""
+用户系统 + 令牌访问控制
+- 注册：邮箱 + 密码 + 邀请码
+- 登录：邮箱 + 密码
+- 仪表板：生成专属访问链接
+- 访问：token绑定用户，非本人拒绝
+"""
+import json, time, os, sqlite3, hashlib, secrets, string
+from datetime import datetime
+from flask import Flask, request, render_template_string, redirect, make_response, g
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+# 线上环境用 /data 持久化目录，本地开发用当前目录
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(__file__))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "app.db")
+VALID_INVITE_CODES = {"INVITE2026", "VIP888", "TEST123"}
+
+# ============ 数据库 ============
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop("db", None)
+    if db:
+        db.close()
+
+def init_db():
+    db = sqlite3.connect(DB_PATH)
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            invite_code TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            daily_links INTEGER DEFAULT 0,
+            last_link_date TEXT,
+            is_blocked INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            expires_at TEXT NOT NULL,
+            used INTEGER DEFAULT 0,
+            access_count INTEGER DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS access_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            token TEXT,
+            ip TEXT,
+            success INTEGER,
+            reason TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        );
+    """)
+    db.commit()
+    db.close()
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def gen_token():
+    chars = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(chars) for _ in range(16))
+
+
+# ============ 页面模板 ============
+
+# Jinja2 使用标准 {{ }} 语法，CSS/JS中的大括号用 {% raw %} 包裹
+
+CSS = """*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f0f;color:#fff;display:flex;justify-content:center;align-items:center;min-height:100vh}.box{background:#1a1a1a;padding:40px;border-radius:12px;max-width:420px;width:90%;border:1px solid #333}h2{margin-bottom:8px;font-size:22px}.subtitle{color:#888;font-size:13px;margin-bottom:24px}input,select{width:100%;padding:12px;border-radius:8px;border:1px solid #444;background:#222;color:#fff;font-size:16px;margin-bottom:14px;outline:none}input:focus{border-color:#6366f1}button{width:100%;padding:12px;border-radius:8px;border:none;background:#6366f1;color:#fff;font-size:16px;cursor:pointer}button:hover{background:#5558e6}button:disabled{background:#444;cursor:not-allowed}button.red{background:#ef4444}button.red:hover{background:#dc2626}a{color:#6366f1;text-decoration:none;font-size:13px}.error{color:#ef4444;font-size:14px;margin-top:8px;text-align:center}.success{color:#22c55e;font-size:14px;margin-top:8px;text-align:center}.nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;font-size:13px;color:#aaa}.nav a{color:#ef4444}.table{width:100%;border-collapse:collapse;font-size:12px;margin-top:16px}.table th{text-align:left;padding:8px;color:#aaa;border-bottom:1px solid #333}.table td{padding:8px;border-bottom:1px solid #222;color:#ccc;word-break:break-all}.token{font-family:monospace;color:#22c55e;font-size:14px}label{font-size:13px;color:#aaa;display:block;margin-bottom:4px}"""
+
+LOGIN_PAGE = (
+    '<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">'
+    '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+    '<title>登录</title><style>' + CSS + '</style></head>'
+    '<body><div class="box" style="text-align:center">'
+    '<h2>登录</h2><p class="subtitle">输入你的账号</p>'
+    '<form method="POST" action="/login">'
+    '<input type="email" name="email" placeholder="邮箱" required>'
+    '<input type="password" name="password" placeholder="密码" required>'
+    '<button type="submit">登录</button>'
+    '</form>'
+    '{% if error %}<p class="error">{{ error }}</p>{% endif %}'
+    '<p style="margin-top:16px"><a href="/register">还没有账号？注册</a></p>'
+    '</div></body></html>'
+)
+
+REGISTER_PAGE = (
+    '<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">'
+    '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+    '<title>注册</title><style>' + CSS + '</style></head>'
+    '<body><div class="box" style="text-align:center">'
+    '<h2>注册</h2><p class="subtitle">创建你的账号（需要邀请码）</p>'
+    '<form method="POST" action="/register">'
+    '<input type="email" name="email" placeholder="邮箱" required>'
+    '<input type="password" name="password" placeholder="密码（至少6位）" required minlength="6">'
+    '<input type="text" name="invite_code" placeholder="邀请码" required>'
+    '<button type="submit">注册</button>'
+    '</form>'
+    '{% if error %}<p class="error">{{ error }}</p>{% endif %}'
+    '<p style="margin-top:16px"><a href="/login">已有账号？登录</a></p>'
+    '</div></body></html>'
+)
+
+DASHBOARD_CSS = CSS + (
+    ".box{max-width:640px;text-align:left}"
+    ".link-box{background:#111;border:1px solid #333;border-radius:8px;padding:12px;margin:8px 0;font-size:13px}"
+    ".link-box .url{color:#6366f1;word-break:break-all}"
+    ".link-box .meta{color:#555;font-size:11px;margin-top:4px}"
+    ".gen-btn{margin:20px 0}"
+    ".copy-btn{background:#333;padding:4px 10px;font-size:11px;border-radius:4px;cursor:pointer;border:none;color:#fff;margin-left:8px}"
+    ".copy-btn:hover{background:#555}"
+)
+
+DASHBOARD = (
+    '<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">'
+    '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+    '<title>仪表板</title><style>' + DASHBOARD_CSS + '</style></head>'
+    '<body><div class="box">'
+    '<div class="nav"><span>已登录：{{ email }}</span><a href="/logout">退出</a></div>'
+    '<h2>仪表板</h2>'
+    '<p style="color:#aaa;font-size:13px;margin-bottom:16px">'
+    '今日已生成：{{ today_count }} 个链接 | 配额：每天最多 {{ max_daily }} 个'
+    '</p>'
+    '<div class="gen-btn">'
+    '<form method="POST" action="/generate_link">'
+    '<button type="submit" {% if quota_full %}disabled{% endif %}>'
+    '{% if quota_full %}今日配额已用完{% else %}生成今日访问链接{% endif %}'
+    '</button>'
+    '</form>'
+    '</div>'
+    '{% if success %}<p class="success">{{ success }}</p>{% endif %}'
+    '{% if error %}<p class="error">{{ error }}</p>{% endif %}'
+    '{% if links %}'
+    '<h3 style="margin-top:24px;font-size:15px;color:#aaa">已生成的链接</h3>'
+    '{% for link in links %}'
+    '<div class="link-box">'
+    '<div><span style="color:#aaa">链接：</span><span class="url">{{ link.url }}</span>'
+    '<button class="copy-btn" onclick="navigator.clipboard.writeText(\'{{ link.url }}\')">复制</button></div>'
+    '<div class="meta">生成：{{ link.created_at }} | 过期：{{ link.expires_at }} | 访问：{{ link.access_count }}次 | '
+    '{% if link.used %}<span style="color:#22c55e">已使用</span>{% else %}<span style="color:#f59e0b">未使用</span>{% endif %}'
+    '</div>'
+    '</div>'
+    '{% endfor %}'
+    '{% endif %}'
+    '</div>'
+    '<script>'
+    'var cbs=document.querySelectorAll(".copy-btn");'
+    'cbs.forEach(function(b){b.addEventListener("click",function(){this.textContent="已复制";setTimeout(function(){b.textContent="复制"},2000)})});'
+    '</script>'
+    '</body></html>'
+)
+
+ACCESS_PAGE = (
+    '<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">'
+    '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+    '<title>资源页面</title><style>' + CSS + '.box{max-width:780px;text-align:left;max-height:85vh;overflow-y:auto}.cat{color:#6366f1;font-size:16px;margin:20px 0 8px 0;border-bottom:1px solid #333;padding-bottom:4px}</style></head>'
+    '<body><div class="box">'
+    '<h2 style="color:#22c55e;text-align:center">访问成功</h2>'
+    '<p style="color:#aaa;text-align:center;margin-bottom:20px;font-size:13px">链接归属：{{ owner_email }}</p>'
+    # ---- 在线工具箱
+    '<h3 class="cat">在线工具箱</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">IT-Tools</td><td style="padding:5px;color:#aaa">加密/转换/网络工具</td><td style="padding:5px"><a href="https://it-tools.tech" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">JustHTMLs</td><td style="padding:5px;color:#aaa">60+纯HTML工具</td><td style="padding:5px"><a href="https://justhtmls.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Mate.tools</td><td style="padding:5px;color:#aaa">文本/图像工具</td><td style="padding:5px"><a href="https://mate.tools" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">WG-Tools</td><td style="padding:5px;color:#aaa">无广告开发者工具</td><td style="padding:5px"><a href="https://wg-tools.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Toolhub</td><td style="padding:5px;color:#aaa">开发者在线工具集</td><td style="padding:5px"><a href="https://toolhub.app" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">ConvertX</td><td style="padding:5px;color:#aaa">1000+格式在线转换</td><td style="padding:5px"><a href="https://convertx.app" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
+    # ---- 设计与图像处理
+    '<h3 class="cat">设计与图像处理</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">Krita</td><td style="padding:5px;color:#aaa">专业开源绘画</td><td style="padding:5px"><a href="https://krita.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Photopea</td><td style="padding:5px;color:#aaa">在线PS替代品</td><td style="padding:5px"><a href="https://www.photopea.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Penpot</td><td style="padding:5px;color:#aaa">开源Figma替代</td><td style="padding:5px"><a href="https://penpot.app" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Excalidraw</td><td style="padding:5px;color:#aaa">手绘风格白板</td><td style="padding:5px"><a href="https://excalidraw.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Graphite</td><td style="padding:5px;color:#aaa">矢量图形编辑器</td><td style="padding:5px"><a href="https://graphite.rs" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">unDraw</td><td style="padding:5px;color:#aaa">免费矢量插图</td><td style="padding:5px"><a href="https://undraw.co" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">PhotoDemon</td><td style="padding:5px;color:#aaa">便携图像编辑器</td><td style="padding:5px"><a href="https://photodemon.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Font Library</td><td style="padding:5px;color:#aaa">海量开源字体</td><td style="padding:5px"><a href="https://fontlibrary.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
+    # ---- AI与数据科学
+    '<h3 class="cat">AI与数据科学</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">DeepSeek</td><td style="padding:5px;color:#aaa">国产大模型</td><td style="padding:5px"><a href="https://chat.deepseek.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Ollama</td><td style="padding:5px;color:#aaa">本地运行大模型</td><td style="padding:5px"><a href="https://ollama.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">NoteGen</td><td style="padding:5px;color:#aaa">AI笔记应用</td><td style="padding:5px"><a href="https://notegen.net" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">OpenManus</td><td style="padding:5px;color:#aaa">Manus开源替代</td><td style="padding:5px"><a href="https://github.com/mannaandpoem/OpenManus" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Qwen通义千问</td><td style="padding:5px;color:#aaa">阿里开源大模型</td><td style="padding:5px"><a href="https://tongyi.aliyun.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Mistral</td><td style="padding:5px;color:#aaa">欧洲开源大模型</td><td style="padding:5px"><a href="https://chat.mistral.ai" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
+    # ---- 办公效率
+    '<h3 class="cat">办公效率</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">VS Code</td><td style="padding:5px;color:#aaa">代码编辑器</td><td style="padding:5px"><a href="https://code.visualstudio.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">LibreOffice</td><td style="padding:5px;color:#aaa">开源办公套件</td><td style="padding:5px"><a href="https://www.libreoffice.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">ONLYOFFICE</td><td style="padding:5px;color:#aaa">协作办公套件</td><td style="padding:5px"><a href="https://www.onlyoffice.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Joplin</td><td style="padding:5px;color:#aaa">加密笔记应用</td><td style="padding:5px"><a href="https://joplinapp.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">MrRSS</td><td style="padding:5px;color:#aaa">AI RSS阅读器</td><td style="padding:5px"><a href="https://github.com/nicepkg/mrrss" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
+    # ---- 实用工具
+    '<h3 class="cat">实用工具</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">Blender</td><td style="padding:5px;color:#aaa">3D创作套件</td><td style="padding:5px"><a href="https://www.blender.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">OBS Studio</td><td style="padding:5px;color:#aaa">录屏/直播</td><td style="padding:5px"><a href="https://obsproject.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">VLC</td><td style="padding:5px;color:#aaa">万能视频播放器</td><td style="padding:5px"><a href="https://www.videolan.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">7-Zip</td><td style="padding:5px;color:#aaa">高压缩比解压</td><td style="padding:5px"><a href="https://7-zip.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">LocalSend</td><td style="padding:5px;color:#aaa">局域网文件传输</td><td style="padding:5px"><a href="https://localsend.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Bitwarden</td><td style="padding:5px;color:#aaa">开源密码管理器</td><td style="padding:5px"><a href="https://bitwarden.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">TestDisk</td><td style="padding:5px;color:#aaa">开源数据恢复</td><td style="padding:5px"><a href="https://www.cgsecurity.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">EasySpider</td><td style="padding:5px;color:#aaa">可视化爬虫工具</td><td style="padding:5px"><a href="https://www.easyspider.net" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">FileConverter</td><td style="padding:5px;color:#aaa">右键菜单转换器</td><td style="padding:5px"><a href="https://file-converter.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Syncthing</td><td style="padding:5px;color:#aaa">局域网文件同步</td><td style="padding:5px"><a href="https://syncthing.net" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
+    # ---- 开发运维
+    '<h3 class="cat">开发运维</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">DBeaver</td><td style="padding:5px;color:#aaa">数据库管理客户端</td><td style="padding:5px"><a href="https://dbeaver.io" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Portainer</td><td style="padding:5px;color:#aaa">Docker可视化管理</td><td style="padding:5px"><a href="https://www.portainer.io" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">n8n</td><td style="padding:5px;color:#aaa">工作流自动化</td><td style="padding:5px"><a href="https://n8n.io" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Webmin</td><td style="padding:5px;color:#aaa">Linux服务器管理</td><td style="padding:5px"><a href="https://webmin.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">RustDesk</td><td style="padding:5px;color:#aaa">开源远程桌面</td><td style="padding:5px"><a href="https://rustdesk.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">WindTerm</td><td style="padding:5px;color:#aaa">跨平台终端工具</td><td style="padding:5px"><a href="https://github.com/kingToolbox/WindTerm" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
+    # ---- 休闲游戏
+    '<h3 class="cat">休闲游戏</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">Wesnoth</td><td style="padding:5px;color:#aaa">回合制奇幻战棋</td><td style="padding:5px"><a href="https://www.wesnoth.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">OpenRA</td><td style="padding:5px;color:#aaa">红警开源重制</td><td style="padding:5px"><a href="https://www.openra.net" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Freeciv</td><td style="padding:5px;color:#aaa">文明风格策略</td><td style="padding:5px"><a href="https://www.freeciv.org" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Andor\u0027s Trail</td><td style="padding:5px;color:#aaa">开放世界RPG</td><td style="padding:5px"><a href="https://andorstrail.com" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Minute Maze</td><td style="padding:5px;color:#aaa">迷宫解谜游戏</td><td style="padding:5px"><a href="https://github.com/niclas-thor/minutemaze" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
+    # ---- Android应用
+    '<h3 class="cat">Android应用</h3>'
+    '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
+    '<tr style="border-bottom:1px solid #333"><th style="text-align:left;padding:5px;color:#aaa">名称</th><th style="text-align:left;padding:5px;color:#aaa">用途</th><th style="text-align:left;padding:5px;color:#aaa">链接</th></tr>'
+    '<tr><td style="padding:5px">Legado阅读</td><td style="padding:5px;color:#aaa">开源小说阅读器</td><td style="padding:5px"><a href="https://github.com/gedoor/legado" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Fossify Notes</td><td style="padding:5px;color:#aaa">开源便签</td><td style="padding:5px"><a href="https://github.com/FossifyOrg/Notes" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">CIMOC</td><td style="padding:5px;color:#aaa">多源漫画阅读器</td><td style="padding:5px"><a href="https://github.com/Haleydu/Cimoc" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Organic Maps</td><td style="padding:5px;color:#aaa">隐私离线地图</td><td style="padding:5px"><a href="https://organicmaps.app" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '<tr><td style="padding:5px">Kotatsu</td><td style="padding:5px;color:#aaa">开源漫画阅读器</td><td style="padding:5px"><a href="https://github.com/nv95/Kotatsu" target="_blank" style="color:#6366f1">打开</a></td></tr>'
+    '</table>'
+    '<p style="color:#555;font-size:11px;text-align:center;margin-top:16px">此链接仅限 {{ owner_email }} 本人访问</p>'
+    '</div></body></html>'
+)
+# ============ 路由 ============
+
+@app.route("/")
+def index():
+    user_email = request.cookies.get("user_email")
+    user_id = request.cookies.get("user_id")
+    if user_email and user_id:
+        return redirect("/dashboard")
+    return render_template_string(LOGIN_PAGE)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template_string(LOGIN_PAGE)
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if not user or user["password_hash"] != hash_password(password):
+        return render_template_string(LOGIN_PAGE, error="邮箱或密码错误")
+    if user["is_blocked"]:
+        return render_template_string(LOGIN_PAGE, error="账号已被封禁")
+    resp = make_response(redirect("/dashboard"))
+    resp.set_cookie("user_email", email, max_age=86400*7, httponly=True)
+    resp.set_cookie("user_id", str(user["id"]), max_age=86400*7, httponly=True)
+    return resp
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "GET":
+        return render_template_string(REGISTER_PAGE)
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+    invite = request.form.get("invite_code", "").strip().upper()
+    if len(password) < 6:
+        return render_template_string(REGISTER_PAGE, error="密码至少6位")
+    if invite not in VALID_INVITE_CODES:
+        return render_template_string(REGISTER_PAGE, error="邀请码无效")
+    db = get_db()
+    existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+    if existing:
+        return render_template_string(REGISTER_PAGE, error="该邮箱已注册")
+    db.execute("INSERT INTO users (email, password_hash, invite_code) VALUES (?,?,?)",
+               (email, hash_password(password), invite))
+    db.commit()
+    user = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+    resp = make_response(redirect("/dashboard"))
+    resp.set_cookie("user_email", email, max_age=86400*7, httponly=True)
+    resp.set_cookie("user_id", str(user["id"]), max_age=86400*7, httponly=True)
+    return resp
+
+
+@app.route("/logout")
+def logout():
+    resp = make_response(redirect("/"))
+    resp.delete_cookie("user_email")
+    resp.delete_cookie("user_id")
+    return resp
+
+
+@app.route("/dashboard")
+def dashboard():
+    user_id = request.cookies.get("user_id")
+    user_email = request.cookies.get("user_email")
+    if not user_id or not user_email:
+        return redirect("/login")
+
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not user:
+        return redirect("/login")
+
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    max_daily = 5
+
+    if user["last_link_date"] != today_str:
+        db.execute("UPDATE users SET daily_links=0, last_link_date=? WHERE id=?", (today_str, user_id))
+        db.commit()
+        user_daily = 0
+    else:
+        user_daily = user["daily_links"]
+
+    links = db.execute(
+        "SELECT * FROM links WHERE user_id=? ORDER BY id DESC LIMIT 20",
+        (user_id,)
+    ).fetchall()
+
+    links_data = []
+    host = request.host
+    for link in links:
+        url = f"http://{host}/a/{link['token']}"
+        links_data.append({
+            "url": url,
+            "token": link["token"],
+            "created_at": link["created_at"],
+            "expires_at": link["expires_at"],
+            "used": link["used"],
+            "access_count": link["access_count"],
+        })
+
+    return render_template_string(
+        DASHBOARD,
+        email=user_email,
+        today_count=user_daily,
+        max_daily=max_daily,
+        quota_full=(user_daily >= max_daily),
+        links=links_data,
+    )
+
+
+@app.route("/generate_link", methods=["POST"])
+def generate_link():
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        return redirect("/login")
+
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    max_daily = 5
+
+    if user["last_link_date"] != today_str:
+        db.execute("UPDATE users SET daily_links=0, last_link_date=? WHERE id=?", (today_str, user_id))
+        db.commit()
+        user_daily = 0
+    else:
+        user_daily = user["daily_links"]
+
+    if user_daily >= max_daily:
+        return redirect("/dashboard")
+
+    token = gen_token()
+    expires = now.replace(hour=23, minute=59, second=59).strftime("%Y-%m-%d %H:%M:%S")
+
+    db.execute(
+        "INSERT INTO links (user_id, token, expires_at) VALUES (?,?,?)",
+        (user_id, token, expires)
+    )
+    db.execute("UPDATE users SET daily_links=daily_links+1 WHERE id=?", (user_id,))
+    db.commit()
+
+    return redirect("/dashboard")
+
+
+@app.route("/a/<token>")
+def access_link(token):
+    db = get_db()
+    link = db.execute("SELECT * FROM links WHERE token=?", (token,)).fetchone()
+
+    if not link:
+        return "<h1 style='color:#ef4444;text-align:center;margin-top:100px'>链接不存在</h1>"
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if now_str > link["expires_at"]:
+        db.execute("INSERT INTO access_log (user_id, token, ip, success, reason) VALUES (?,?,?,?,?)",
+                   (link["user_id"], token, request.remote_addr, 0, "expired"))
+        db.commit()
+        return "<h1 style='color:#f59e0b;text-align:center;margin-top:100px'>链接已过期</h1>"
+
+    visitor_id = request.cookies.get("user_id")
+    owner_user = db.execute("SELECT email FROM users WHERE id=?", (link["user_id"],)).fetchone()
+
+    if str(visitor_id) != str(link["user_id"]):
+        db.execute("INSERT INTO access_log (user_id, token, ip, success, reason) VALUES (?,?,?,?,?)",
+                   (link["user_id"], token, request.remote_addr, 0, "not_owner"))
+        db.execute("UPDATE links SET access_count=access_count+1 WHERE id=?", (link["id"],))
+        db.commit()
+        return "<h1 style='color:#ef4444;text-align:center;margin-top:100px'>此链接仅限生成者本人访问<br><span style='color:#aaa;font-size:14px'>非本人访问已被记录</span></h1>"
+
+    db.execute("UPDATE links SET used=1, access_count=access_count+1 WHERE id=?", (link["id"],))
+    db.execute("INSERT INTO access_log (user_id, token, ip, success, reason) VALUES (?,?,?,?,?)",
+               (link["user_id"], token, request.remote_addr, 1, "ok"))
+    db.commit()
+
+    return render_template_string(ACCESS_PAGE, owner_email=owner_user["email"])
+
+
+# ============ 启动 ============
+
+if __name__ == "__main__":
+    init_db()
+    port = int(os.environ.get("PORT", 5000))
+    host = os.environ.get("HOST", "127.0.0.1")
+    print(f"服务器启动：http://{host}:{port}")
+    print(f"邀请码：{VALID_INVITE_CODES}")
+    app.run(host=host, port=port, debug=False)

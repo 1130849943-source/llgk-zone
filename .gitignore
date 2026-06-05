@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.db
+.env
+*.bat
+*.lnk
+v0/
+temp/

@@ -1,0 +1,5 @@
+用户系统启动成功
+本地访问：http://127.0.0.1:5000
+注册需要邀请码，有效的邀请码： {'VIP888', 'TEST123', 'INVITE2026'}
+ * Serving Flask app 'server'
+ * Debug mode: off
