@@ -41,6 +41,7 @@ DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(__file__))
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "app.db")
 VALID_INVITE_CODES = {"INVITE2026", "VIP888", "TEST123"}
+ADMIN_EMAILS = {"1130849943@qq.com"}
 
 # ============ 数据库 ============
 
@@ -154,7 +155,7 @@ DASHBOARD = (
     '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
     '<title>仪表板</title><style>' + DASHBOARD_CSS + '</style></head>'
     '<body><div class="box">'
-    '<div class="nav"><span>已登录：{{ email }}</span><a href="/logout">退出</a></div>'
+    '<div class="nav"><span>已登录：{{ email }}{% if is_admin %} <a href="/admin" style="color:#f59e0b">管理面板</a>{% endif %}</span><a href="/logout">退出</a></div>'
     '<h2>仪表板</h2>'
     '<p style="color:#aaa;font-size:13px;margin-bottom:16px">'
     '今日已生成：{{ today_count }} 个链接 | 配额：每天最多 {{ max_daily }} 个'
@@ -186,6 +187,34 @@ DASHBOARD = (
     'cbs.forEach(function(b){b.addEventListener("click",function(){this.textContent="已复制";setTimeout(function(){b.textContent="复制"},2000)})});'
     '</script>'
     '</body></html>'
+)
+
+ADMIN_PAGE = (
+    '<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">'
+    '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+    '<title>管理员面板</title><style>' + CSS + '.box{max-width:960px;text-align:left}.admin-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:16px}.admin-table th{text-align:left;padding:10px 8px;color:#aaa;border-bottom:2px solid #444;background:#1e1e1e;position:sticky;top:0}.admin-table td{padding:10px 8px;border-bottom:1px solid #222;color:#ccc}.admin-table tr:hover{background:#252525}.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px}.badge-blocked{background:#3b1c1c;color:#ef4444}.badge-active{background:#1c3b1c;color:#22c55e}.stats{color:#888;font-size:13px;margin-top:16px;text-align:right}</style></head>'
+    '<body><div class="box">'
+    '<div class="nav"><span>管理员面板</span><a href="/dashboard">返回仪表板</a></div>'
+    '<h2>用户管理</h2>'
+    '<p style="color:#aaa;font-size:13px;margin-bottom:16px">所有注册用户列表</p>'
+    '<table class="admin-table">'
+    '<thead><tr>'
+    '<th>ID</th><th>邮箱</th><th>邀请码</th><th>注册时间</th><th>今日链接数</th><th>最后链接日期</th><th>状态</th>'
+    '</tr></thead><tbody>'
+    '{% for user in users %}'
+    '<tr>'
+    '<td>{{ user.id }}</td>'
+    '<td>{{ user.email }}</td>'
+    '<td>{{ user.invite_code }}</td>'
+    '<td>{{ user.created_at }}</td>'
+    '<td>{{ user.daily_links }}</td>'
+    '<td>{{ user.last_link_date or "-" }}</td>'
+    '<td>{% if user.is_blocked %}<span class="badge badge-blocked">已封禁</span>{% else %}<span class="badge badge-active">正常</span>{% endif %}</td>'
+    '</tr>'
+    '{% endfor %}'
+    '</tbody></table>'
+    '<div class="stats">总注册用户数：{{ total }}</div>'
+    '</div></body></html>'
 )
 
 ACCESS_PAGE = (
@@ -489,6 +518,7 @@ def dashboard():
             "access_count": link["access_count"],
         })
 
+    is_admin = (user_email in ADMIN_EMAILS)
     return render_template_string(
         DASHBOARD,
         email=user_email,
@@ -496,6 +526,7 @@ def dashboard():
         max_daily=max_daily,
         quota_full=(user_daily >= max_daily),
         links=links_data,
+        is_admin=is_admin,
     )
 
 
@@ -565,6 +596,20 @@ def access_link(token):
     db.commit()
 
     return render_template_string(ACCESS_PAGE, owner_email=owner_user["email"])
+
+
+@app.route("/admin")
+def admin_panel():
+    user_id = request.cookies.get("user_id")
+    user_email = request.cookies.get("user_email")
+    if not user_id or not user_email:
+        return redirect("/login")
+    if user_email not in ADMIN_EMAILS:
+        return "<h1 style='color:#ef4444;text-align:center;margin-top:100px'>无权访问</h1>"
+    db = get_db()
+    users = db.execute("SELECT id, email, invite_code, created_at, daily_links, last_link_date, is_blocked FROM users ORDER BY id DESC").fetchall()
+    users_data = [dict(u) for u in users]
+    return render_template_string(ADMIN_PAGE, email=user_email, users=users_data, total=len(users_data))
 
 
 # ============ 启动 ============
